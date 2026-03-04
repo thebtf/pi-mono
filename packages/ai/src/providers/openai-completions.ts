@@ -29,6 +29,7 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
+import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { buildBaseOptions, clampReasoning } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -128,7 +129,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 							partial: output,
 						});
 					} else if (block.type === "toolCall") {
-						block.arguments = JSON.parse(block.partialArgs || "{}");
+						block.arguments = parseStreamingJson(block.partialArgs);
 						delete block.partialArgs;
 						stream.push({
 							type: "toolcall_end",
@@ -166,7 +167,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 					calculateCost(model, output.usage);
 				}
 
-				const choice = chunk.choices[0];
+				const choice = chunk.choices?.[0];
 				if (!choice) continue;
 
 				if (choice.finish_reason) {
@@ -359,28 +360,12 @@ function createClient(
 
 	const headers = { ...model.headers };
 	if (model.provider === "github-copilot") {
-		// Copilot expects X-Initiator to indicate whether the request is user-initiated
-		// or agent-initiated (e.g. follow-up after assistant/tool messages). If there is
-		// no prior message, default to user-initiated.
-		const messages = context.messages || [];
-		const lastMessage = messages[messages.length - 1];
-		const isAgentCall = lastMessage ? lastMessage.role !== "user" : false;
-		headers["X-Initiator"] = isAgentCall ? "agent" : "user";
-		headers["Openai-Intent"] = "conversation-edits";
-
-		// Copilot requires this header when sending images
-		const hasImages = messages.some((msg) => {
-			if (msg.role === "user" && Array.isArray(msg.content)) {
-				return msg.content.some((c) => c.type === "image");
-			}
-			if (msg.role === "toolResult" && Array.isArray(msg.content)) {
-				return msg.content.some((c) => c.type === "image");
-			}
-			return false;
+		const hasImages = hasCopilotVisionInput(context.messages);
+		const copilotHeaders = buildCopilotDynamicHeaders({
+			messages: context.messages,
+			hasImages,
 		});
-		if (hasImages) {
-			headers["Copilot-Vision-Request"] = "true";
-		}
+		Object.assign(headers, copilotHeaders);
 	}
 
 	// Merge options headers last so they can override defaults
@@ -438,16 +423,12 @@ function buildParams(model: Model<"openai-completions">, context: Context, optio
 		params.tool_choice = options.toolChoice;
 	}
 
-	if (compat.thinkingFormat === "zai" && model.reasoning) {
-		// Z.ai uses binary thinking: { type: "enabled" | "disabled" }
-		// Must explicitly disable since z.ai defaults to thinking enabled
-		(params as any).thinking = { type: options?.reasoningEffort ? "enabled" : "disabled" };
-	} else if (compat.thinkingFormat === "qwen" && model.reasoning) {
-		// Qwen uses enable_thinking: boolean
+	if ((compat.thinkingFormat === "zai" || compat.thinkingFormat === "qwen") && model.reasoning) {
+		// Both Z.ai and Qwen use enable_thinking: boolean
 		(params as any).enable_thinking = !!options?.reasoningEffort;
 	} else if (options?.reasoningEffort && model.reasoning && compat.supportsReasoningEffort) {
 		// OpenAI-style reasoning_effort
-		params.reasoning_effort = options.reasoningEffort;
+		(params as any).reasoning_effort = mapReasoningEffort(options.reasoningEffort, compat.reasoningEffortMap);
 	}
 
 	// OpenRouter provider routing preferences
@@ -467,6 +448,13 @@ function buildParams(model: Model<"openai-completions">, context: Context, optio
 	}
 
 	return params;
+}
+
+function mapReasoningEffort(
+	effort: NonNullable<OpenAICompletionsOptions["reasoningEffort"]>,
+	reasoningEffortMap: Partial<Record<NonNullable<OpenAICompletionsOptions["reasoningEffort"]>, string>>,
+): string {
+	return reasoningEffortMap[effort] ?? effort;
 }
 
 function maybeAddOpenRouterAnthropicCacheControl(
@@ -523,10 +511,6 @@ export function convertMessages(
 		}
 
 		if (model.provider === "openai") return id.length > 40 ? id.slice(0, 40) : id;
-		// Copilot Claude models route to Claude backend which requires Anthropic ID format
-		if (model.provider === "github-copilot" && model.id.toLowerCase().includes("claude")) {
-			return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
-		}
 		return id;
 	};
 
@@ -800,13 +784,26 @@ function detectCompat(model: Model<"openai-completions">): Required<OpenAIComple
 	const useMaxTokens = provider === "mistral" || baseUrl.includes("mistral.ai") || baseUrl.includes("chutes.ai");
 
 	const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
+	const isGroq = provider === "groq" || baseUrl.includes("groq.com");
 
 	const isMistral = provider === "mistral" || baseUrl.includes("mistral.ai");
+
+	const reasoningEffortMap =
+		isGroq && model.id === "qwen/qwen3-32b"
+			? {
+					minimal: "default",
+					low: "default",
+					medium: "default",
+					high: "default",
+					xhigh: "default",
+				}
+			: {};
 
 	return {
 		supportsStore: !isNonStandard,
 		supportsDeveloperRole: !isNonStandard,
 		supportsReasoningEffort: !isGrok && !isZai,
+		reasoningEffortMap,
 		supportsUsageInStreaming: true,
 		maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
 		requiresToolResultName: isMistral,
@@ -832,6 +829,7 @@ function getCompat(model: Model<"openai-completions">): Required<OpenAICompletio
 		supportsStore: model.compat.supportsStore ?? detected.supportsStore,
 		supportsDeveloperRole: model.compat.supportsDeveloperRole ?? detected.supportsDeveloperRole,
 		supportsReasoningEffort: model.compat.supportsReasoningEffort ?? detected.supportsReasoningEffort,
+		reasoningEffortMap: model.compat.reasoningEffortMap ?? detected.reasoningEffortMap,
 		supportsUsageInStreaming: model.compat.supportsUsageInStreaming ?? detected.supportsUsageInStreaming,
 		maxTokensField: model.compat.maxTokensField ?? detected.maxTokensField,
 		requiresToolResultName: model.compat.requiresToolResultName ?? detected.requiresToolResultName,

@@ -22,9 +22,15 @@ let cachedVertexAdcCredentialsExists: boolean | null = null;
 
 function hasVertexAdcCredentials(): boolean {
 	if (cachedVertexAdcCredentialsExists === null) {
-		// In browser or if node modules not loaded yet, return false
+		// If node modules haven't loaded yet (async import race at startup),
+		// return false WITHOUT caching so the next call retries once they're ready.
+		// Only cache false permanently in a browser environment where fs is never available.
 		if (!_existsSync || !_homedir || !_join) {
-			cachedVertexAdcCredentialsExists = false;
+			const isNode = typeof process !== "undefined" && (process.versions?.node || process.versions?.bun);
+			if (!isNode) {
+				// Definitively in a browser — safe to cache false permanently
+				cachedVertexAdcCredentialsExists = false;
+			}
 			return false;
 		}
 
@@ -107,6 +113,7 @@ export function getEnvApiKey(provider: any): string | undefined {
 		"minimax-cn": "MINIMAX_CN_API_KEY",
 		huggingface: "HF_TOKEN",
 		opencode: "OPENCODE_API_KEY",
+		"opencode-go": "OPENCODE_API_KEY",
 		"kimi-coding": "KIMI_API_KEY",
 	};
 
